@@ -2,7 +2,7 @@
 
 ## Which logic to Follow
 1. As there is competition guidelines and lower time to finish we use PID logic
-## Contraints
+## Constraints
 1. No weight constrains
 2. The power supply should be on board
 3. 12v Potential difference across every point
