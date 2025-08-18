@@ -11,9 +11,13 @@
 6. Other general
 ## Hardware Components To Use
 - BG37 12v 300RP / 600RPM
+- Or N20 Motor 12v / 600 RPM
 - TB6612FNG(OR ANY HIGHER POWER MOTOR Use it with a heat sync)
 - 25 x 25 x 25 cm Chassis constraints 
 - 12v battery (Use lipo or 3.7v lithium with BMS)
+- IR ARRAY POLUL QTR Sensor 8 sensor array
+- Use a I2C expander for reducing the usage of GPIO Pins
+- 
 
 # Progress
 | Day | Process | Progress |
