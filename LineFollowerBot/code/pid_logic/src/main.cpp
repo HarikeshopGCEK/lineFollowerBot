@@ -1,22 +1,41 @@
 
 #include <Arduino.h>
-#include <Wire.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 
-// PCF8575 I2C address
-#define PCF8575_ADDRESS 0x20
-#define IR_SENSOR_COUNT 8
-const int sensorWeights[IR_SENSOR_COUNT] = {-35, -25, -15, -5, 5, 15, 25, 35};
+// ESP32 Pin Definitions for Multiplexer (CD4067)
+#define S0 12  // Brown wire - Channel select bit 0 (LSB)
+#define S1 13  // Orange wire - Channel select bit 1
+#define S2 14  // Purple wire - Channel select bit 2
+#define S3 15  // Yellow wire - Channel select bit 3 (MSB)
 
-// Motor pins (adjust as per your hardware)
-const int ENA = 5;    // Left motor PWM
-const int IN1 = 18;   // Left motor direction
-const int IN2 = 19;   // Left motor direction
-const int ENB = 17;   // Right motor PWM
-const int IN3 = 16;   // Right motor direction
-const int IN4 = 4;    // Right motor direction
-const int STBY = 2;   // TB6612FNG Standby pin (change pin number as needed)
+// Multiplexer Analog Output Pin (ESP32 ADC1_CH6)
+#define MUX_OUT 34  // GPIO34 - ADC1_CH6 (Input only)
+
+// Number of channels on the multiplexer
+#define NUM_CHANNELS 16
+#define IR_SENSOR_COUNT 16
+
+// Small delay for multiplexer to settle after channel selection (in microseconds)
+#define MUX_SETTLE_DELAY_US 100
+
+// Number of calibration samples to take per channel
+#define NUM_CALIBRATION_SAMPLES 700
+
+// Arrays to store calibration data
+int minValues[NUM_CHANNELS], maxValues[NUM_CHANNELS], medianValues[NUM_CHANNELS];
+
+// Sensor weights for 16 sensors (centered around 0)
+const int sensorWeights[IR_SENSOR_COUNT] = {-70, -60, -50, -40, -30, -20, -10, 0, 0, 10, 20, 30, 40, 50, 60, 70};
+
+// ESP32 Motor Driver Pins (TB6612FNG)
+const int ENA = 27;   // Left motor PWM (Channel 0)
+const int IN1 = 26;   // Left motor direction A
+const int IN2 = 25;   // Left motor direction B
+const int ENB = 33;   // Right motor PWM (Channel 1)
+const int IN3 = 32;   // Right motor direction A
+const int IN4 = 35;   // Right motor direction B
+const int STBY = 21;  // TB6612FNG Standby pin
 
 
 // PID variables
@@ -28,11 +47,89 @@ int baseSpeed = 120; // Adjust as needed
 
 AsyncWebServer server(80);
 
+/**
+ * @brief Selects the active channel on the CD4067 multiplexer.
+ * @param channel The channel number to select (0-15).
+ */
+void selectMuxChannel(byte channel)
+{
+  // S0 is LSB, S3 is MSB
+  digitalWrite(S0, (channel & 0x01) ? HIGH : LOW); // bit 0
+  digitalWrite(S1, (channel & 0x02) ? HIGH : LOW); // bit 1
+  digitalWrite(S2, (channel & 0x04) ? HIGH : LOW); // bit 2
+  digitalWrite(S3, (channel & 0x08) ? HIGH : LOW); // bit 3
+  delayMicroseconds(MUX_SETTLE_DELAY_US);          // Allow multiplexer to settle
+}
+
+/**
+ * @brief Performs sensor calibration to determine min, max, and median values for each channel.
+ */
+void calibrateSensors()
+{
+  Serial.println("Starting sensor calibration...");
+
+  // Initialize min/max values for all channels (12-bit ADC: 0-4095)
+  for (int i = 0; i < NUM_CHANNELS; i++)
+  {
+    minValues[i] = 4095; // Initialize with maximum possible value (12-bit)
+    maxValues[i] = 0;    // Initialize with minimum possible value
+  }
+
+  Serial.print("Taking ");
+  Serial.print(NUM_CALIBRATION_SAMPLES);
+  Serial.println(" samples across all channels...");
+  delay(1000);
+
+  // Take NUM_CALIBRATION_SAMPLES iterations, reading all channels in each iteration
+  for (int i = 0; i < NUM_CALIBRATION_SAMPLES; i++)
+  {
+    // Read all channels for this sample iteration
+    for (int j = 0; j < NUM_CHANNELS; j++)
+    {
+      selectMuxChannel(j);
+      int reading = analogRead(MUX_OUT);
+
+      // Update min/max for channel j
+      if (reading < minValues[j])
+        minValues[j] = reading;
+      if (reading > maxValues[j])
+        maxValues[j] = reading;
+      // Optional: Add a small delay between reading channels in the same sample iteration
+      delay(1);
+    }
+    // Optional: Add a delay between sample iterations
+    delay(10);
+  }
+
+  // Calculate median (simple average of min/max) and print results after all samples are taken
+  Serial.println("Calibration complete. Results:");
+  Serial.println("-------------------");
+  Serial.println("Channel\tMin Value\tMax Value\tMedian Value");
+  Serial.println("-------------------");
+  for (int i = 0; i < NUM_CHANNELS; i++)
+  {
+    medianValues[i] = (minValues[i] + maxValues[i]) / 2;
+    Serial.print(i);
+    Serial.print("\t");
+    Serial.print(minValues[i]);
+    Serial.print("\t");
+    Serial.print(maxValues[i]);
+    Serial.print("\t");
+    Serial.println(medianValues[i]);
+  }
+}
 
 void setup() {
     Serial.begin(115200);
-    Wire.begin();
+    Serial.println("ESP32 - 16 Channel IR Sensor Line Follower with PID Control");
 
+    // Set up multiplexer select pins
+    pinMode(S0, OUTPUT);
+    pinMode(S1, OUTPUT);
+    pinMode(S2, OUTPUT);
+    pinMode(S3, OUTPUT);
+
+    // Set up motor control pins
     pinMode(ENA, OUTPUT);
     pinMode(IN1, OUTPUT);
     pinMode(IN2, OUTPUT);
@@ -41,6 +138,18 @@ void setup() {
     pinMode(IN4, OUTPUT);
     pinMode(STBY, OUTPUT);
     digitalWrite(STBY, HIGH); // Enable motor driver
+
+    // ESP32 ADC Configuration for better performance
+    analogReadResolution(12);  // Set ADC resolution to 12-bit (0-4095)
+    analogSetAttenuation(ADC_11db);  // Set ADC attenuation for 0-3.3V range
+
+    // Perform sensor calibration
+    // IMPORTANT: During calibration, move the robot over both line and background
+    // to get accurate min/max values for each sensor
+    calibrateSensors();
+    Serial.println("-------------------");
+    Serial.println("Setup complete. Starting line following...");
+    delay(1000);
 
     // Set up ESP32 as Access Point
     WiFi.softAP("PID-Bot", "447643899");
@@ -89,32 +198,54 @@ void setup() {
 }
 
 int getLineError() {
-    Wire.requestFrom(PCF8575_ADDRESS, 2);
-    if (Wire.available() >= 2) {
-        uint8_t lowByte = Wire.read();   // P0-P7
-        uint8_t highByte = Wire.read();  // P8-P15
-        uint8_t irData = lowByte;
-
-        // Print sensor states for debugging
-        Serial.print("IR Sensors: ");
-        for (int i = 0; i < IR_SENSOR_COUNT; i++) {
-            Serial.print((irData >> i) & 1);
-            Serial.print(" ");
-        }
-        Serial.println();
-
-        int weightedSum = 0;
-        int activeSensors = 0;
-        for (int i = 0; i < IR_SENSOR_COUNT; i++) {
-            if ((irData >> i) & 1) {
-                weightedSum += sensorWeights[i];
-                activeSensors++;
-            }
-        }
-        if (activeSensors > 0) {
-            return weightedSum / activeSensors;
+    int weightedSum = 0;
+    int activeSensors = 0;
+    int sensorStates[IR_SENSOR_COUNT];
+    
+    // Read all sensors through the multiplexer
+    for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+        selectMuxChannel(i);
+        int sensorValue = analogRead(MUX_OUT);
+        
+        // Map the sensor reading from its calibrated range to 0-4095 (12-bit)
+        int mappedValue = map(sensorValue, minValues[i], maxValues[i], 0, 4095);
+        
+        // Constrain the mapped value to ensure it stays within 0-4095
+        mappedValue = constrain(mappedValue, 0, 4095);
+        
+        // Determine if sensor detects line (assuming line is darker than background)
+        // For your sensors: 4095 = white/background, lower values = black line
+        // Threshold can be adjusted based on your setup (try 3000-3500 for better sensitivity)
+        int threshold = 3000; // Adjusted for better line detection sensitivity
+        sensorStates[i] = (mappedValue < threshold) ? 1 : 0;
+        
+        if (sensorStates[i]) {
+            weightedSum += sensorWeights[i];
+            activeSensors++;
         }
     }
+    
+    // Print sensor states for debugging (optional - can be removed for better performance)
+    Serial.print("Raw Values: ");
+    for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+        selectMuxChannel(i);
+        int rawValue = analogRead(MUX_OUT);
+        Serial.print(rawValue);
+        Serial.print(" ");
+    }
+    Serial.println();
+    
+    Serial.print("Sensor States: ");
+    for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+        Serial.print(sensorStates[i]);
+        Serial.print(" ");
+    }
+    Serial.println();
+    
+    if (activeSensors > 0) {
+        return weightedSum / activeSensors;
+    }
+    
     // If no line detected, return previous error (or 0)
     return previous_error;
 }
