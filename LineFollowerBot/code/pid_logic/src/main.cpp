@@ -45,6 +45,11 @@ volatile float Kd = 1.0;
 float error = 0, previous_error = 0, integral = 0, derivative = 0;
 int baseSpeed = 120; // Adjust as needed
 
+// Turning behavior parameters
+float sharpTurnThreshold = 0.7;  // Percentage of baseSpeed (0.7 = 70%)
+float tankTurnMultiplier = 0.8;  // How aggressive the tank turning is (0.8 = 80%)
+bool enableTankSteering = true;  // Enable/disable tank steering mode
+
 AsyncWebServer server(80);
 
 // Global variables for sensor data (for web visualization)
@@ -458,8 +463,22 @@ void loop()
 
   float correction = Kp * error + Ki * integral + Kd * derivative;
 
-  int leftSpeed = baseSpeed + correction;
-  int rightSpeed = baseSpeed - correction;
+  int leftSpeed, rightSpeed;
+  
+  if (enableTankSteering && abs(correction) > baseSpeed * sharpTurnThreshold) {
+    // Tank steering: one wheel forward, one wheel backward for sharp turns
+    if (correction > 0) { // Turn right
+      leftSpeed = baseSpeed + abs(correction) * tankTurnMultiplier;   // Left wheel forward (faster)
+      rightSpeed = -(abs(correction) * tankTurnMultiplier);           // Right wheel backward
+    } else { // Turn left
+      leftSpeed = -(abs(correction) * tankTurnMultiplier);            // Left wheel backward
+      rightSpeed = baseSpeed + abs(correction) * tankTurnMultiplier;  // Right wheel forward (faster)
+    }
+  } else {
+    // Differential speed: both wheels forward at different speeds
+    leftSpeed = baseSpeed + correction;
+    rightSpeed = baseSpeed - correction;
+  }
 
   setMotorSpeed(leftSpeed, rightSpeed);
 
