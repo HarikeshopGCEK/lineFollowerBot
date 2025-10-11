@@ -453,39 +453,44 @@ void setMotorSpeed(int leftSpeed, int rightSpeed)
 void loop()
 {
   error = getLineError();
+  // Anti-windup: reset integral if error crosses zero
+  if ((error > 0 && previous_error < 0) || (error < 0 && previous_error > 0))
+  {
+    integral = 0;
+  }
   integral += error;
-  // Clamp the integral term to prevent windup
-  const float MAX_INTEGRAL = 1000.0;
-  if (integral > MAX_INTEGRAL)
-    integral = MAX_INTEGRAL;
-  if (integral < -MAX_INTEGRAL)
-    integral = -MAX_INTEGRAL;
+  integral = constrain(integral, -1000, 1000); // Prevent windup
   derivative = error - previous_error;
 
   float correction = Kp * error + Ki * integral + Kd * derivative;
+  correction = constrain(correction, -200, 200); // Limit PID output
 
   int leftSpeed, rightSpeed;
 
   if (enableTankSteering && abs(correction) > baseSpeed * sharpTurnThreshold)
   {
-    // Tank steering: one wheel forward, one wheel backward for sharp turns
+    // Simplified tank steering
     if (correction > 0)
-    {                                                               // Turn right
-      leftSpeed = baseSpeed + abs(correction) * tankTurnMultiplier; // Left wheel forward (faster)
-      rightSpeed = -(abs(correction) * tankTurnMultiplier);         // Right wheel backward
+    {
+      leftSpeed = baseSpeed;
+      rightSpeed = -baseSpeed * tankTurnMultiplier;
     }
     else
-    {                                                                // Turn left
-      leftSpeed = -(abs(correction) * tankTurnMultiplier);           // Left wheel backward
-      rightSpeed = baseSpeed + abs(correction) * tankTurnMultiplier; // Right wheel forward (faster)
+    {
+      leftSpeed = -baseSpeed * tankTurnMultiplier;
+      rightSpeed = baseSpeed;
     }
   }
   else
   {
-    // Differential speed: both wheels forward at different speeds
+    // Differential steering
     leftSpeed = baseSpeed + correction;
     rightSpeed = baseSpeed - correction;
   }
+
+  // Final safety limits
+  leftSpeed = constrain(leftSpeed, -255, 255);
+  rightSpeed = constrain(rightSpeed, -255, 255);
 
   setMotorSpeed(leftSpeed, rightSpeed);
 
