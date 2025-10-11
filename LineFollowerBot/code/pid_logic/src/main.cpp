@@ -36,6 +36,12 @@ const int IN3 = 32;  // Right motor direction A
 const int IN4 = 4;   // Right motor direction B
 const int STBY = 21; // TB6612FNG Standby pin
 
+// PWM channels for ESP32 LEDC
+#define LEFT_PWM_CHANNEL 0
+#define RIGHT_PWM_CHANNEL 1
+#define PWM_FREQ 20000 // 20kHz for quiet operation
+#define PWM_RES_BITS 8 // 8-bit resolution (0-255)
+
 // PID variables
 volatile float Kp = 2.0;
 volatile float Ki = 0.0;
@@ -148,6 +154,12 @@ void setup()
   pinMode(IN4, OUTPUT);
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH); // Enable motor driver
+
+  // Set up LEDC PWM for motors
+  ledcSetup(LEFT_PWM_CHANNEL, PWM_FREQ, PWM_RES_BITS);
+  ledcSetup(RIGHT_PWM_CHANNEL, PWM_FREQ, PWM_RES_BITS);
+  ledcAttachPin(ENA, LEFT_PWM_CHANNEL);
+  ledcAttachPin(ENB, RIGHT_PWM_CHANNEL);
 
   // ESP32 ADC Configuration for better performance
   analogReadResolution(12);       // Set ADC resolution to 12-bit (0-4095)
@@ -433,7 +445,7 @@ void setMotorSpeed(int leftSpeed, int rightSpeed)
     digitalWrite(IN2, HIGH);
     leftSpeed = -leftSpeed;
   }
-  analogWrite(ENA, constrain(leftSpeed, 0, 255));
+  ledcWrite(LEFT_PWM_CHANNEL, constrain(leftSpeed, 0, 255));
 
   // Right motor
   if (rightSpeed >= 0)
@@ -447,7 +459,7 @@ void setMotorSpeed(int leftSpeed, int rightSpeed)
     digitalWrite(IN4, HIGH);
     rightSpeed = -rightSpeed;
   }
-  analogWrite(ENB, constrain(rightSpeed, 0, 255));
+  ledcWrite(RIGHT_PWM_CHANNEL, constrain(rightSpeed, 0, 255));
 }
 
 void loop()
