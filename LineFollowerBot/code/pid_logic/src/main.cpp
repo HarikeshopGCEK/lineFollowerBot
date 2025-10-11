@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -37,18 +36,17 @@ const int IN3 = 32;  // Right motor direction A
 const int IN4 = 4;   // Right motor direction B
 const int STBY = 21; // TB6612FNG Standby pin
 
-
 // PID variables
 volatile float Kp = 2.0;
 volatile float Ki = 0.0;
 volatile float Kd = 1.0;
 float error = 0, previous_error = 0, integral = 0, derivative = 0;
-int baseSpeed = 120; // Adjust as needed
+int baseSpeed = 200; // Adjust as needed
 
 // Turning behavior parameters
-float sharpTurnThreshold = 0.7;  // Percentage of baseSpeed (0.7 = 70%)
-float tankTurnMultiplier = 0.8;  // How aggressive the tank turning is (0.8 = 80%)
-bool enableTankSteering = true;  // Enable/disable tank steering mode
+float sharpTurnThreshold = 0.7; // Percentage of baseSpeed (0.7 = 70%)
+float tankTurnMultiplier = 0.8; // How aggressive the tank turning is (0.8 = 80%)
+bool enableTankSteering = true; // Enable/disable tank steering mode
 
 AsyncWebServer server(80);
 
@@ -57,7 +55,6 @@ int sensorStates[IR_SENSOR_COUNT];
 int sensorRawValues[IR_SENSOR_COUNT];
 int currentError = 0;
 int activeSensors = 0;
-
 
 /**
  * @brief Selects the active channel on the CD4067 multiplexer.
@@ -151,7 +148,6 @@ void setup()
   pinMode(IN4, OUTPUT);
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH); // Enable motor driver
-
 
   // ESP32 ADC Configuration for better performance
   analogReadResolution(12);       // Set ADC resolution to 12-bit (0-4095)
@@ -356,7 +352,6 @@ void setup()
         json += "}";
         request->send(200, "application/json", json); });
 
-
   server.begin();
 }
 
@@ -459,22 +454,34 @@ void loop()
 {
   error = getLineError();
   integral += error;
+  // Clamp the integral term to prevent windup
+  const float MAX_INTEGRAL = 1000.0;
+  if (integral > MAX_INTEGRAL)
+    integral = MAX_INTEGRAL;
+  if (integral < -MAX_INTEGRAL)
+    integral = -MAX_INTEGRAL;
   derivative = error - previous_error;
 
   float correction = Kp * error + Ki * integral + Kd * derivative;
 
   int leftSpeed, rightSpeed;
-  
-  if (enableTankSteering && abs(correction) > baseSpeed * sharpTurnThreshold) {
+
+  if (enableTankSteering && abs(correction) > baseSpeed * sharpTurnThreshold)
+  {
     // Tank steering: one wheel forward, one wheel backward for sharp turns
-    if (correction > 0) { // Turn right
-      leftSpeed = baseSpeed + abs(correction) * tankTurnMultiplier;   // Left wheel forward (faster)
-      rightSpeed = -(abs(correction) * tankTurnMultiplier);           // Right wheel backward
-    } else { // Turn left
-      leftSpeed = -(abs(correction) * tankTurnMultiplier);            // Left wheel backward
-      rightSpeed = baseSpeed + abs(correction) * tankTurnMultiplier;  // Right wheel forward (faster)
+    if (correction > 0)
+    {                                                               // Turn right
+      leftSpeed = baseSpeed + abs(correction) * tankTurnMultiplier; // Left wheel forward (faster)
+      rightSpeed = -(abs(correction) * tankTurnMultiplier);         // Right wheel backward
     }
-  } else {
+    else
+    {                                                                // Turn left
+      leftSpeed = -(abs(correction) * tankTurnMultiplier);           // Left wheel backward
+      rightSpeed = baseSpeed + abs(correction) * tankTurnMultiplier; // Right wheel forward (faster)
+    }
+  }
+  else
+  {
     // Differential speed: both wheels forward at different speeds
     leftSpeed = baseSpeed + correction;
     rightSpeed = baseSpeed - correction;
