@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <AsyncTCP.h>            // Required for ESP32 + ESPAsyncWebServer
 #include <ESPAsyncWebServer.h>
 
 // ESP32 Pin Definitions for Multiplexer (CD4067)
@@ -47,9 +48,18 @@ volatile float Kp = 2.0;
 volatile float Ki = 0.0;
 volatile float Kd = 1.0;
 float error = 0, previous_error = 0, integral = 0, derivative = 0;
-int baseSpeed = 200; // Adjust as needed
+int baseSpeed = 200; // Adjust as needed (can be changed from web UI)
 
-// Turning behavior parameters
+// State flags
+volatile bool calibrationDone = false; // Set true when calibration completes
+volatile bool shouldRun = false;        // Set true when Start button pressed
+
+// Forward declaration so lambdas in setup() can call it
+void setMotorSpeed(int leftSpeed, int rightSpeed);
+int getLineError();
+void calibrateSensors();
+
+ // Turning behavior parameters
 float sharpTurnThreshold = 0.7; // Percentage of baseSpeed (0.7 = 70%)
 float tankTurnMultiplier = 0.8; // How aggressive the tank turning is (0.8 = 80%)
 bool enableTankSteering = true; // Enable/disable tank steering mode
@@ -62,10 +72,11 @@ int sensorRawValues[IR_SENSOR_COUNT];
 int currentError = 0;
 int activeSensors = 0;
 
-/**
- * @brief Selects the active channel on the CD4067 multiplexer.
- * @param channel The channel number to select (0-15).
- */
+// Filtering buffers for moving average
+#define FILTER_N 5
+int sensorFilterBuf[IR_SENSOR_COUNT][FILTER_N] = {0};
+int sensorFilterIdx[IR_SENSOR_COUNT] = {0};
+
 void selectMuxChannel(byte channel)
 {
   // S0 is LSB, S3 is MSB
@@ -76,9 +87,6 @@ void selectMuxChannel(byte channel)
   delayMicroseconds(MUX_SETTLE_DELAY_US);          // Allow multiplexer to settle
 }
 
-/**
- * @brief Performs sensor calibration to determine min, max, and median values for each channel.
- */
 void calibrateSensors()
 {
   Serial.println("Starting sensor calibration...");
@@ -109,11 +117,12 @@ void calibrateSensors()
         minValues[j] = reading;
       if (reading > maxValues[j])
         maxValues[j] = reading;
-      // Optional: Add a small delay between reading channels in the same sample iteration
+
+      // short delay so ADC has time (keeps calibration stable)
       delay(1);
     }
-    // Optional: Add a delay between sample iterations
-    delay(10);
+    // small pause between iterations
+    delay(5);
   }
 
   // Calculate median (simple average of min/max) and print results after all samples are taken
@@ -132,6 +141,8 @@ void calibrateSensors()
     Serial.print("\t");
     Serial.println(medianValues[i]);
   }
+  // Mark calibration complete so UI can enable Start
+  calibrationDone = true;
 }
 
 void setup()
@@ -163,21 +174,16 @@ void setup()
 
   // ESP32 ADC Configuration for better performance
   analogReadResolution(12);       // Set ADC resolution to 12-bit (0-4095)
-  analogSetAttenuation(ADC_11db); // Set ADC attenuation for 0-3.3V range
+  analogSetPinAttenuation(MUX_OUT, ADC_11db); // using pin-specific attenuation API
 
-  // Perform sensor calibration
-  // IMPORTANT: During calibration, move the robot over both line and background
-  // to get accurate min/max values for each sensor
-  calibrateSensors();
-  Serial.println("-------------------");
-  Serial.println("Setup complete. Starting line following...");
-  delay(1000);
-
-  // Set up ESP32 as Access Point
+  // Set up ESP32 as Access Point BEFORE calibration so the web UI can show progress
   WiFi.softAP("PID-Bot", "447643899");
   IPAddress IP = WiFi.softAPIP();
   Serial.print("AP IP address: ");
   Serial.println(IP);
+
+  // Start calibration (non-blocking idea: calibration here is blocking but acceptable for initial setup)
+  calibrateSensors();
 
   // Enhanced web page with PID tuning and line detection visualization
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -209,24 +215,27 @@ void setup()
             "@media (max-width: 1200px) { .container { flex-direction: column; align-items: center; } }"
             "</style></head><body>"
             "<h2>🤖 Line Follower Bot Dashboard</h2>"
+            "<div style='margin-bottom:12px;'>"
+            "Calibration status: <span id='calibStatus' style='font-weight:bold;color:#ffeb3b;'>Unknown</span> "
+            "</div>"
             "<div class='container'>"
             "<div class='card pid-card'>"
             "<h3>PID Tuning Controls</h3>"
             "<form action='/set' method='get' id='pidForm'>"
             "<div class='slider-label'>Kp: <span class='value' id='kpVal'>" + String(Kp) + "</span></div>"
             "<div class='input-container'>"
-            "<input type='range' min='0' max='10' step='0.01' name='kp' class='slider' value='" + String(Kp) + "' id='kpSlider' oninput='updateKp(this.value)'>"
-            "<input type='number' min='0' max='10' step='0.01' class='text-input' id='kpInput' value='" + String(Kp) + "' oninput='updateKpSlider(this.value)'>"
+            "<input type='range' min='0' max='50' step='0.01' name='kp' class='slider' value='" + String(Kp) + "' id='kpSlider' oninput='updateKp(this.value)'>"
+            "<input type='number' min='0' max='50' step='0.01' class='text-input' id='kpInput' value='" + String(Kp) + "' oninput='updateKpSlider(this.value)'>"
             "</div>"
             "<div class='slider-label'>Ki: <span class='value' id='kiVal'>" + String(Ki) + "</span></div>"
             "<div class='input-container'>"
-            "<input type='range' min='0' max='2' step='0.01' name='ki' class='slider' value='" + String(Ki) + "' id='kiSlider' oninput='updateKi(this.value)'>"
-            "<input type='number' min='0' max='2' step='0.01' class='text-input' id='kiInput' value='" + String(Ki) + "' oninput='updateKiSlider(this.value)'>"
+            "<input type='range' min='0' max='5' step='0.001' name='ki' class='slider' value='" + String(Ki) + "' id='kiSlider' oninput='updateKi(this.value)'>"
+            "<input type='number' min='0' max='5' step='0.001' class='text-input' id='kiInput' value='" + String(Ki) + "' oninput='updateKiSlider(this.value)'>"
             "</div>"
             "<div class='slider-label'>Kd: <span class='value' id='kdVal'>" + String(Kd) + "</span></div>"
             "<div class='input-container'>"
-            "<input type='range' min='0' max='5' step='0.01' name='kd' class='slider' value='" + String(Kd) + "' id='kdSlider' oninput='updateKd(this.value)'>"
-            "<input type='number' min='0' max='5' step='0.01' class='text-input' id='kdInput' value='" + String(Kd) + "' oninput='updateKdSlider(this.value)'>"
+            "<input type='range' min='0' max='20' step='0.01' name='kd' class='slider' value='" + String(Kd) + "' id='kdSlider' oninput='updateKd(this.value)'>"
+            "<input type='number' min='0' max='20' step='0.01' class='text-input' id='kdInput' value='" + String(Kd) + "' oninput='updateKdSlider(this.value)'>"
             "</div>"
             "<br><button type='submit'>Update PID</button>"
             "<br><button type='button' class='reset-btn' onclick='resetValues()'>Reset to Defaults</button>"
@@ -244,6 +253,12 @@ void setup()
             "<span>Current PID: Kp=<span class='value' id='currentKp'>" + String(Kp) + "</span> Ki=<span class='value' id='currentKi'>" + String(Ki) + "</span> Kd=<span class='value' id='currentKd'>" + String(Kd) + "</span></span>"
             "</div>"
             "</div>"
+            "</div>"
+            "<div style='width:100%; text-align:center; margin-top:18px;'>"
+            "<button id='startBtn' onclick='startRun()' style='background:#00e676;color:#000;'>Start</button>"
+            "<button id='stopBtn' onclick='stopRun()' class='reset-btn'>Stop</button>"
+            "<div style='margin-top:12px;'>Speed: <span id='speedVal'>" + String(baseSpeed) + "</span>"
+            "<input type='range' min='0' max='255' step='1' id='speedSlider' value='" + String(baseSpeed) + "' oninput='updateSpeed(this.value)'></div>"
             "</div>"
             "</div>"
             "<script>"
@@ -270,7 +285,7 @@ void setup()
             "  document.getElementById('lineError').textContent = data.error;"
             "  document.getElementById('activeCount').textContent = data.activeSensors;"
             "  document.getElementById('currentKp').textContent = data.kp.toFixed(2);"
-            "  document.getElementById('currentKi').textContent = data.ki.toFixed(2);"
+            "  document.getElementById('currentKi').textContent = data.ki.toFixed(3);"
             "  document.getElementById('currentKd').textContent = data.kd.toFixed(2);"
             "}"
             "function fetchSensorData() {"
@@ -279,13 +294,27 @@ void setup()
             "    .then(data => updateSensorDisplay(data))"
             "    .catch(error => console.log('Error:', error));"
             "}"
+            "function updateCalibrationStatus(done) {"
+            "  var el = document.getElementById('calibStatus');"
+            "  if (done) { el.textContent = 'Done'; el.style.color = '#00e676'; } else { el.textContent = 'Running...'; el.style.color = '#ff5722'; }"
+            "}"
+            "function startRun() {"
+            "  fetch('/start').then(r => { if (r.status==200) { alert('Run started'); } else { r.text().then(t=>alert('Cannot start: '+t)); } });"
+            "}"
+            "function stopRun() {"
+            "  fetch('/stop').then(r => { if (r.status==200) { alert('Stopped'); } });"
+            "}"
+            "function updateSpeed(value) {"
+            "  document.getElementById('speedVal').textContent = value;"
+            "  fetch('/setSpeed?speed=' + value).then(r=>r.text()).then(t=>console.log('Speed set to', t));"
+            "}"
             "function updateKp(value) {"
             "  document.getElementById('kpVal').innerText = parseFloat(value).toFixed(2);"
             "  document.getElementById('kpInput').value = parseFloat(value).toFixed(2);"
             "}"
             "function updateKi(value) {"
-            "  document.getElementById('kiVal').innerText = parseFloat(value).toFixed(2);"
-            "  document.getElementById('kiInput').value = parseFloat(value).toFixed(2);"
+            "  document.getElementById('kiVal').innerText = parseFloat(value).toFixed(3);"
+            "  document.getElementById('kiInput').value = parseFloat(value).toFixed(3);"
             "}"
             "function updateKd(value) {"
             "  document.getElementById('kdVal').innerText = parseFloat(value).toFixed(2);"
@@ -293,21 +322,21 @@ void setup()
             "}"
             "function updateKpSlider(value) {"
             "  var numValue = parseFloat(value);"
-            "  if (numValue >= 0 && numValue <= 10) {"
+            "  if (numValue >= 0 && numValue <= 50) {"
             "    document.getElementById('kpSlider').value = numValue;"
             "    document.getElementById('kpVal').innerText = numValue.toFixed(2);"
             "  }"
             "}"
             "function updateKiSlider(value) {"
             "  var numValue = parseFloat(value);"
-            "  if (numValue >= 0 && numValue <= 2) {"
+            "  if (numValue >= 0 && numValue <= 5) {"
             "    document.getElementById('kiSlider').value = numValue;"
-            "    document.getElementById('kiVal').innerText = numValue.toFixed(2);"
+            "    document.getElementById('kiVal').innerText = numValue.toFixed(3);"
             "  }"
             "}"
             "function updateKdSlider(value) {"
             "  var numValue = parseFloat(value);"
-            "  if (numValue >= 0 && numValue <= 5) {"
+            "  if (numValue >= 0 && numValue <= 20) {"
             "    document.getElementById('kdSlider').value = numValue;"
             "    document.getElementById('kdVal').innerText = numValue.toFixed(2);"
             "  }"
@@ -330,6 +359,7 @@ void setup()
             "  initSensorArray();"
             "  fetchSensorData();"
             "  updateInterval = setInterval(fetchSensorData, 200);"
+            "  setInterval(()=>{ fetch('/sensorData').then(r=>r.json()).then(d=>{ updateCalibrationStatus(!!d.calibrationDone); document.getElementById('startBtn').disabled = !d.calibrationDone; document.getElementById('speedSlider').value = d.baseSpeed; document.getElementById('speedVal').textContent = d.baseSpeed; if(d.running) { document.getElementById('startBtn').style.display='none'; } else { document.getElementById('startBtn').style.display='inline-block'; } }); }, 500);"
             "};"
             "</script>"
             "</body></html>";
@@ -345,7 +375,7 @@ void setup()
   // API endpoint for sensor data (for real-time visualization)
   server.on("/sensorData", HTTP_GET, [](AsyncWebServerRequest *request)
             {
-        String json = "{";
+    String json = "{";
         json += "\"sensorStates\":[";
         for(int i = 0; i < IR_SENSOR_COUNT; i++) {
           json += String(sensorStates[i]);
@@ -356,40 +386,80 @@ void setup()
           json += String(sensorRawValues[i]);
           if(i < IR_SENSOR_COUNT - 1) json += ",";
         }
-        json += "],\"error\":" + String(currentError) + ",";
-        json += "\"activeSensors\":" + String(activeSensors) + ",";
-        json += "\"kp\":" + String(Kp) + ",";
-        json += "\"ki\":" + String(Ki) + ",";
-        json += "\"kd\":" + String(Kd);
+  json += "],\"error\":" + String(currentError) + ",";
+  json += "\"activeSensors\":" + String(activeSensors) + ",";
+  json += "\"kp\":" + String(Kp, 6) + ",";
+  json += "\"ki\":" + String(Ki, 6) + ",";
+  json += "\"kd\":" + String(Kd, 6);
+        // Add runtime flags and base speed
+        json += ",\"calibrationDone\":" + String(calibrationDone ? 1 : 0);
+        json += ",\"running\":" + String(shouldRun ? 1 : 0);
+        json += ",\"baseSpeed\":" + String(baseSpeed);
         json += "}";
         request->send(200, "application/json", json); });
+
+  // Endpoint to start the run (only effective after calibration)
+  server.on("/start", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+      if (calibrationDone) {
+        shouldRun = true;
+        request->send(200, "text/plain", "started");
+      } else {
+        request->send(400, "text/plain", "calibration_not_done");
+      }
+  });
+
+  // Endpoint to stop the run immediately
+  server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+      shouldRun = false;
+      // Ensure motors are stopped immediately by setting speeds to 0
+      setMotorSpeed(0,0);
+      request->send(200, "text/plain", "stopped");
+  });
+
+  // Endpoint to set base speed independently (AJAX)
+  server.on("/setSpeed", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+      if (request->hasParam("speed")) {
+        int s = request->getParam("speed")->value().toInt();
+        baseSpeed = constrain(s, 0, 255);
+      }
+      request->send(200, "text/plain", String(baseSpeed));
+  });
 
   server.begin();
 }
 
 int getLineError()
 {
-  int weightedSum = 0;
+  long weightedSum = 0;
   activeSensors = 0; // Use global variable
 
   // Read all sensors through the multiplexer
   for (int i = 0; i < IR_SENSOR_COUNT; i++)
   {
     selectMuxChannel(i);
-    int sensorValue = analogRead(MUX_OUT);
+    int rawValue = analogRead(MUX_OUT);
+    // Moving average filter
+    sensorFilterBuf[i][sensorFilterIdx[i]] = rawValue;
+    sensorFilterIdx[i] = (sensorFilterIdx[i] + 1) % FILTER_N;
+    int sum = 0;
+    for (int k = 0; k < FILTER_N; k++) sum += sensorFilterBuf[i][k];
+    int sensorValue = sum / FILTER_N;
 
-    // Store raw sensor value for visualization
+    // Store filtered value for visualization
     sensorRawValues[i] = sensorValue;
 
-    // Map the sensor reading from its calibrated range to 0-4095 (12-bit)
-    int mappedValue = map(sensorValue, minValues[i], maxValues[i], 0, 4095);
+    // If calibration data is invalid (min==max) fall back to filtered reading
+    int mappedValue;
+    if (maxValues[i] <= minValues[i]) {
+      mappedValue = sensorValue;
+    } else {
+      long tmp = map(sensorValue, minValues[i], maxValues[i], 0, 4095);
+      mappedValue = (int)constrain(tmp, 0, 4095);
+    }
 
-    // Constrain the mapped value to ensure it stays within 0-4095
-    mappedValue = constrain(mappedValue, 0, 4095);
-
-    // Determine if sensor detects line (assuming line is darker than background)
-    // For your sensors: 4095 = white/background, lower values = black line
-    // Threshold can be adjusted based on your setup (try 3000-3500 for better sensitivity)
     int threshold = 3000; // Adjusted for better line detection sensitivity
     sensorStates[i] = (mappedValue < threshold) ? 1 : 0;
 
@@ -400,13 +470,11 @@ int getLineError()
     }
   }
 
-  // Print sensor states for debugging (optional - can be removed for better performance)
+  // Print sensor states for debugging
   Serial.print("Raw Values: ");
   for (int i = 0; i < IR_SENSOR_COUNT; i++)
   {
-    selectMuxChannel(i);
-    int rawValue = analogRead(MUX_OUT);
-    Serial.print(rawValue);
+    Serial.print(sensorRawValues[i]);
     Serial.print(" ");
   }
   Serial.println();
@@ -421,13 +489,13 @@ int getLineError()
 
   if (activeSensors > 0)
   {
-    currentError = weightedSum / activeSensors;
+    currentError = (int)(weightedSum / activeSensors);
     return currentError;
   }
 
-  // If no line detected, return previous error (or 0)
-  currentError = previous_error;
-  return previous_error;
+  // If no line detected, return previous error
+  currentError = (int)previous_error;
+  return (int)previous_error;
 }
 
 void setMotorSpeed(int leftSpeed, int rightSpeed)
@@ -479,25 +547,33 @@ void loop()
 
   int leftSpeed, rightSpeed;
 
+  if (!shouldRun) {
+    // Not allowed to run yet; ensure motors are stopped
+    setMotorSpeed(0, 0);
+    previous_error = error;
+    delay(10);
+    return;
+  }
+
   if (enableTankSteering && abs(correction) > baseSpeed * sharpTurnThreshold)
   {
     // Simplified tank steering
     if (correction > 0)
     {
       leftSpeed = baseSpeed;
-      rightSpeed = -baseSpeed * tankTurnMultiplier;
+      rightSpeed = - (int)(baseSpeed * tankTurnMultiplier);
     }
     else
     {
-      leftSpeed = -baseSpeed * tankTurnMultiplier;
+      leftSpeed = - (int)(baseSpeed * tankTurnMultiplier);
       rightSpeed = baseSpeed;
     }
   }
   else
   {
     // Differential steering
-    leftSpeed = baseSpeed + correction;
-    rightSpeed = baseSpeed - correction;
+    leftSpeed = baseSpeed + (int)correction;
+    rightSpeed = baseSpeed - (int)correction;
   }
 
   // Final safety limits
